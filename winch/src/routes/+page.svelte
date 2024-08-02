@@ -7,15 +7,17 @@
 	let analyser;
 	let microphone;
 	let javascriptNode;
+    let recordingSession = 0;
 	let mediaRecorder;
 	let isRecording = false;
 	let error = null;
 	let transcriptions = [];
 	let detectedJoke: { text: string; funniness: number } | null = null;
-    let playJokeSoundEffect = false;
-    let soundEffect;
+	let playJokeSoundEffect = false;
+    let audioStream;
+	let soundEffect;
 
-	const SILENCE_THRESHOLD = 0.01; // Adjust based on your needs
+	const SILENCE_THRESHOLD = 0.03; // Adjust based on your needs
 	const SILENCE_DURATION = 1000; // milliseconds
 	const SIGNIFICANT_AUDIO_THRESHOLD = 0.1; // Adjust based on your needs
 	let silenceStart = null;
@@ -24,7 +26,7 @@
 
 	onMount(() => {
 		setupAudioContext();
-        soundEffect = new Audio('/sound/wow.mp3');
+		soundEffect = new Audio('/sound/wow.mp3');
 	});
 
 	onDestroy(() => {
@@ -33,109 +35,175 @@
 		}
 	});
 
-	function setupAudioContext() {
-		audioContext = new (window.AudioContext || window.webkitAudioContext)();
-		analyser = audioContext.createAnalyser();
-		javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
 
-		analyser.smoothingTimeConstant = 0.8;
-		analyser.fftSize = 1024;
 
-		javascriptNode.onaudioprocess = processAudio;
+async function setupAudioContext() {
+    if (audioContext) {
+        await audioContext.close();
+    }
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    javascriptNode = audioContext.createScriptProcessor(2048, 1, 1);
 
-		navigator.mediaDevices
-			.getUserMedia({ audio: true })
-			.then((stream) => {
-				microphone = audioContext.createMediaStreamSource(stream);
-				microphone.connect(analyser);
-				analyser.connect(javascriptNode);
-				javascriptNode.connect(audioContext.destination);
+    analyser.smoothingTimeConstant = 0.8;
+    analyser.fftSize = 1024;
 
-				mediaRecorder = new MediaRecorder(stream);
-				mediaRecorder.ondataavailable = (event) => {
-					audioChunks.push(event.data);
-				};
-			})
-			.catch((err) => {
-				error = 'Could not access microphone: ' + err.message;
-			});
-	}
+    javascriptNode.onaudioprocess = processAudio;
 
-	function processAudio(e) {
-		const array = new Uint8Array(analyser.frequencyBinCount);
-		analyser.getByteFrequencyData(array);
-		const values = array.reduce((a, b) => a + b, 0) / array.length;
-		const volume = values / 128.0; // 0 to 1
+    try {
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        microphone = audioContext.createMediaStreamSource(audioStream);
+        microphone.connect(analyser);
+        analyser.connect(javascriptNode);
+        javascriptNode.connect(audioContext.destination);
 
-        if (volume >= SIGNIFICANT_AUDIO_THRESHOLD && !hasReachedSignificantLevel) {
-            console.log('wut')
-            audioChunks = []
+        mediaRecorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm' });
+        mediaRecorder.ondataavailable = event => {
+            audioChunks.push(event.data);
+        };
+    } catch (err) {
+        error = "Could not access microphone: " + err.message;
+    }
+}
+
+async function startRecording() {
+    recordingSession++;
+    console.log(`[Session ${recordingSession}] Starting recording`);
+    
+    await setupAudioContext();
+    
+    audioChunks = [];
+    hasReachedSignificantLevel = false;
+    
+    if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+    }
+    
+    mediaRecorder.start(500);
+}
+
+function stopRecording() {
+    console.log(`[Session ${recordingSession}] Stopping recording`);
+    
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+    }
+    
+    if (microphone) {
+        microphone.disconnect();
+    }
+    if (analyser) {
+        analyser.disconnect();
+    }
+    if (javascriptNode) {
+        javascriptNode.disconnect();
+    }
+    
+    if (audioStream) {
+        audioStream.getTracks().forEach(track => track.stop());
+    }
+    
+    if (hasReachedSignificantLevel) {
+        sendAudioChunk();
+    }
+    hasReachedSignificantLevel = false;
+}
+
+function toggleRecording() {
+    if (isRecording) {
+        stopRecording();
+    } else {
+        startRecording();
+    }
+    isRecording = !isRecording;
+}
+
+
+    function normalizeAudioBuffer(buffer) {
+    const channelData = buffer.getChannelData(0);
+    const maxAmplitude = Math.max(...channelData.map(Math.abs));
+    const scaleFactor = 1 / maxAmplitude;
+
+    const normalizedBuffer = audioContext.createBuffer(
+        buffer.numberOfChannels,
+        buffer.length,
+        buffer.sampleRate
+    );
+
+    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+        const newChannelData = normalizedBuffer.getChannelData(channel);
+        const originalChannelData = buffer.getChannelData(channel);
+
+        for (let i = 0; i < buffer.length; i++) {
+            newChannelData[i] = originalChannelData[i] * scaleFactor;
+        }
+    }
+
+    return normalizedBuffer;
+}
+
+function audioBufferToBlob(buffer) {
+    const numberOfChannels = buffer.numberOfChannels;
+    const length = buffer.length * numberOfChannels * 2;
+    const audioData = new ArrayBuffer(length);
+    const view = new DataView(audioData);
+    let offset = 0;
+    
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+        const channelData = buffer.getChannelData(channel);
+        for (let i = 0; i < buffer.length; i++) {
+            const sample = Math.max(-1, Math.min(1, channelData[i]));
+            view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+            offset += 2;
+        }
+    }
+
+    const blob = new Blob([view], { type: 'audio/wav' });
+    return blob;
+}
+
+
+async function sendProcessedAudio(blob) {
+    await analyzeWebM(blob);
+
+    const formData = new FormData();
+    formData.append('audio', blob, 'processed_recording.wav');
+
+    try {
+        const response = await fetch('/api', {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            throw new Error('Server response was not ok.');
         }
 
+        const result = await response.json();
+        console.log('Upload successful:', result);
+        // Handle the response as needed
+    } catch (err) {
+        error = "Error uploading processed audio: " + err.message;
+    }
+}
 
-		if (volume >= SIGNIFICANT_AUDIO_THRESHOLD) {
-			hasReachedSignificantLevel = true;
-		}
-
-		if (hasReachedSignificantLevel) {
-			if (volume < SILENCE_THRESHOLD) {
-				if (silenceStart === null) {
-					silenceStart = Date.now();
-				} else if (Date.now() - silenceStart > SILENCE_DURATION) {
-					sendAudioChunk();
-					silenceStart = null;
-					hasReachedSignificantLevel = false; // Reset for the next chunk
-				}
-			} else {
-				silenceStart = null;
-			}
-		}
-	}
-
-	function toggleRecording() {
-		if (isRecording) {
-			stopRecording();
-		} else {
-			startRecording();
-		}
-		isRecording = !isRecording;
-	}
-
-	function startRecording() {
-		audioChunks = [];
-		hasReachedSignificantLevel = false;
-		if (mediaRecorder) {
-			mediaRecorder.stop();
-			microphone.disconnect();
-			analyser.disconnect();
-			javascriptNode.disconnect();
-		}
-		setupAudioContext(); // Re-setup the audio context
-		mediaRecorder.start(10); // Collect data every 10ms
-	}
-
-	function stopRecording() {
-		mediaRecorder.stop();
-		if (hasReachedSignificantLevel) {
-			sendAudioChunk(); // Send any remaining audio if it reached significant level
-		}
-		hasReachedSignificantLevel = false;
-	}
-
-    
-    
 async function sendAudioChunk() {
     if (audioChunks.length === 0) return;
 
+    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+    console.log('Audio Blob created, size:', audioBlob.size, 'type:', audioBlob.type);
+
+    // Add a small delay to ensure the blob is fully written
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const uint8Array = new Uint8Array(arrayBuffer);
+    console.log('First 20 bytes of the audio blob:', uint8Array.slice(0, 20));
+
+    const formData = new FormData();
+    formData.append('audio', audioBlob, 'recording.webm');
+
     try {
-        
-        // Combine all chunks into a single Blob
-        const combinedBlob = new Blob(audioChunks, { type: 'audio/webm; codecs=opus' });
-        console.log(`Combined blob size: ${combinedBlob.size} bytes`);
-
-        const formData = new FormData();
-        formData.append('audio', combinedBlob, 'recording.webm');
-
         const response = await fetch('/api', {
             method: 'POST',
             body: formData
@@ -147,61 +215,184 @@ async function sendAudioChunk() {
 
         const result = await response.json();
         console.log('Upload successful:', result);
-        // ... (rest of the function remains the same)
+
+        if (result.success) {
+            
+            if (result.results.length > 0) {
+                transcriptions = result
+                    .results
+                    .map(r => r.transcription)
+                    .filter(t => t.trim().length > 0);
+
+                const joke = result.results.find(r => r.isJoke);
+
+                if (joke) {
+                    detectedJoke = {
+                        text: joke.transcription,
+                        funniness: joke.funniness
+                    };
+                    playJokeSoundEffect = true;
+                }
+
+                console.log('Transcriptions:', transcriptions);
+                console.log('Detected Joke:', detectedJoke);
+
+                if (playJokeSoundEffect) {
+                    playSound();
+                }
+
+                // Clear the transcriptions after a few seconds
+                playJokeSoundEffect = false;
+            }
+        }
+        // Handle the response as needed
     } catch (err) {
-        console.error('Error in sendAudioChunk:', err);
-        error = 'Error uploading audio: ' + err.message;
+        error = "Error uploading audio: " + err.message;
+        console.error(error);
     }
 
-    audioChunks = []; // Clear the chunks for the next recording
-}
-async function formatWebMChunks(chunks) {
-    const combinedBlob = new Blob(chunks, { type: 'audio/webm' });
-    const arrayBuffer = await combinedBlob.arrayBuffer();
+    // Clear the audioChunks array for the next set of chunks
+    audioChunks = [];
 
-    if (isValidWebMHeader(arrayBuffer)) {
-        return combinedBlob; // If we already have a valid header, return the blob as is
+    // clear the silenceStart and hasReachedSignificantLevel flags
+    silenceStart = null;
+    hasReachedSignificantLevel = false;
+
+    // remove all existing data
+}
+
+
+
+    async function preprocessAndSendAudioChunk() {
+    if (audioChunks.length === 0) return;
+
+    // Step 1: Concatenate all audio chunks
+    const blob = new Blob(audioChunks, { type: 'audio/webm' });
+
+    // Step 2: Convert blob to ArrayBuffer
+    const arrayBuffer = await blob.arrayBuffer();
+
+    // Step 3: Create AudioBuffer from ArrayBuffer
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+    // Step 4: Process the AudioBuffer (e.g., normalize volume)
+    const processedBuffer = normalizeAudioBuffer(audioBuffer);
+
+    // Step 5: Convert processed AudioBuffer back to Blob
+    const processedBlob = audioBufferToBlob(processedBuffer);
+
+    // Step 6: Send the processed audio
+    await sendProcessedAudio(processedBlob);
+
+    // Clear the audioChunks array for the next set of chunks
+    audioChunks = [];
+}
+
+
+
+	function processAudio(e) {
+    const array = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(array);
+    const values = array.reduce((a, b) => a + b, 0) / array.length;
+    const volume = values / 128.0; // 0 to 1
+
+    if (volume >= SIGNIFICANT_AUDIO_THRESHOLD) {
+        hasReachedSignificantLevel = true;
     }
 
-    // If we don't have a valid header, we need to create one
-    const header = createWebMHeader();
-    const headerArrayBuffer = await header.arrayBuffer();
+    if (hasReachedSignificantLevel) {
+        if (volume < SILENCE_THRESHOLD) {
+            if (silenceStart === null) {
+                silenceStart = Date.now();
+            } else if (Date.now() - silenceStart > SILENCE_DURATION) {
+                stopRecording();
+                silenceStart = null;
+                hasReachedSignificantLevel = false; // Reset for the next chunk
 
-    const newArrayBuffer = new ArrayBuffer(headerArrayBuffer.byteLength + arrayBuffer.byteLength);
-    new Uint8Array(newArrayBuffer).set(new Uint8Array(headerArrayBuffer), 0);
-    new Uint8Array(newArrayBuffer).set(new Uint8Array(arrayBuffer), headerArrayBuffer.byteLength);
-
-    return new Blob([newArrayBuffer], { type: 'audio/webm' });
-}
-
-function isValidWebMHeader(arrayBuffer) {
-    const header = new Uint8Array(arrayBuffer.slice(0, 4));
-    return header[0] === 0x1A && header[1] === 0x45 && header[2] === 0xDF && header[3] === 0xA3;
-}
-
-function createWebMHeader() {
-    // Basic WebM header structure
-    const header = new Uint8Array([
-        0x1A, 0x45, 0xDF, 0xA3, // EBML
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, // EBML size (31 bytes)
-        0x42, 0x86, 0x81, 0x01, // EBMLVersion = 1
-        0x42, 0xF7, 0x81, 0x01, // EBMLReadVersion = 1
-        0x42, 0xF2, 0x81, 0x04, // EBMLMaxIDLength = 4
-        0x42, 0xF3, 0x81, 0x08, // EBMLMaxSizeLength = 8
-        0x42, 0x82, 0x84, 0x77, 0x65, 0x62, 0x6D, // DocType = "webm"
-        0x42, 0x87, 0x81, 0x02, // DocTypeVersion = 2
-        0x42, 0x85, 0x81, 0x02  // DocTypeReadVersion = 2
-    ]);
-
-    return new Blob([header], { type: 'audio/webm' });
+                // delay
+                setTimeout(() => {
+                    console.log('cool')
+                }, 1000);
+                startRecording();
+            }
+        } else {
+            silenceStart = null;
+        }
+    }
 }
 
 
 
-  function playSound() {
-    soundEffect.play();
-  }
 
+
+
+async function analyzeWebM(blob) {
+     const arrayBuffer = await blob.arrayBuffer();
+     const dataView = new DataView(arrayBuffer);
+     
+     console.log('File size:', blob.size, 'bytes');
+     console.log('First 50 bytes:', Array.from(new Uint8Array(arrayBuffer.slice(0, 50))).map(b => b.toString(16).padStart(2, '0')).join(' '));
+     
+     // Check for EBML header
+     if (dataView.getUint32(0) === 0x1A45DFA3) {
+       console.log('EBML header found');
+     } else {
+       console.log('EBML header not found');
+     }
+     
+     // Add more checks for other important WebM elements
+   }
+
+
+
+
+async function validateWebM(blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const uint8Array = new Uint8Array(arrayBuffer);
+    
+    console.log('First 20 bytes of the file:', uint8Array.slice(0, 20));
+
+    // Check for EBML header
+    const ebmlHeader = [0x1A, 0x45, 0xDF, 0xA3];
+    let isEBML = true;
+    for (let i = 0; i < ebmlHeader.length; i++) {
+        if (uint8Array[i] !== ebmlHeader[i]) {
+            isEBML = false;
+            break;
+        }
+    }
+
+    if (!isEBML) {
+        console.log('EBML header not found, checking for alternative WebM structures...');
+        
+        // Check for common WebM elements
+        const webmElements = [
+            [0x42, 0x82], // DocType
+            [0x18, 0x53, 0x80, 0x67], // Segment
+            [0x16, 0x54, 0xAE, 0x6B]  // Tracks
+        ];
+
+        for (const element of webmElements) {
+            const index = uint8Array.findIndex((byte, i) => 
+                element.every((elementByte, j) => uint8Array[i + j] === elementByte)
+            );
+            if (index !== -1) {
+                console.log(`Found WebM element at index ${index}`);
+                return true;
+            }
+        }
+
+        console.error('No valid WebM structure found');
+        return false;
+    }
+
+    console.log('Valid EBML header found');
+    return true;
+}
+
+	function playSound() {
+		soundEffect.play();
+	}
 </script>
 
 <main class="container mx-auto p-4">
