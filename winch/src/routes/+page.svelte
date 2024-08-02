@@ -46,8 +46,7 @@
     try {
       const response = await fetch('/api', {
         method: 'POST',
-        body: formData,
-        // Do not set Content-Type header manually
+        body: formData
       });
 
       if (!response.ok) {
@@ -60,7 +59,6 @@
       error = "Error uploading audio: " + err.message;
     }
   }
-
 </script>
 
 <main class="container mx-auto p-4">
