@@ -28,22 +28,6 @@ export const POST: RequestHandler = async ({ request }) => {
       return json({ success: false, message: 'No audio file received' }, { status: 400 });
     }
 
-    const arrayBuffer = await audioFile.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Save buffer to a temporary file
-    const tempDir = path.join(process.cwd(), 'temp');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir);
-    }
-
-    const randomId = Math.random().toString(36).substring(7);
-
-    const tempFilePath = path.join(tempDir, `temp_${Date.now()}_${randomId}.webm`);
-    fs.writeFileSync(tempFilePath, buffer);
-
-    const chunks = [tempFilePath];
-
     // Transcribe non-silent chunks and check for jokes
     const results = await processAudioFile(audioFile);
 

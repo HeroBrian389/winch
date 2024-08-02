@@ -2,6 +2,8 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { Button } from '@/components/ui/button';
 	import { Alert, AlertDescription } from '@/components/ui/alert';
+    import JSConfetti from 'js-confetti'
+
 
 	let audioContext;
 	let analyser;
@@ -16,6 +18,10 @@
 	let playJokeSoundEffect = false;
     let audioStream;
 	let soundEffect;
+
+
+
+
 
 	const SILENCE_THRESHOLD = 0.03; // Adjust based on your needs
 	const SILENCE_DURATION = 1000; // milliseconds
@@ -238,6 +244,8 @@ async function sendAudioChunk() {
                 console.log('Detected Joke:', detectedJoke);
 
                 if (playJokeSoundEffect) {
+                    const jsConfetti = new JSConfetti()
+                    jsConfetti.addConfetti()
                     playSound();
                 }
 
