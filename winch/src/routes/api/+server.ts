@@ -45,7 +45,7 @@ export const POST: RequestHandler = async ({ request }) => {
     const chunks = [tempFilePath];
 
     // Transcribe non-silent chunks and check for jokes
-    const results = await transcribeAndAnalyzeChunks(chunks);
+    const results = await processAudioFile(audioFile);
 
     console.log(results)
 
@@ -63,6 +63,45 @@ export const POST: RequestHandler = async ({ request }) => {
     return json({ success: false, message: 'Error processing audio' }, { status: 500 });
   }
 };
+
+async function processAudioFile(file: File): Promise<Array<{transcription: string, isJoke: boolean, funniness?: number}>> {
+  try {
+    // Create a new FormData object and append the file
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+
+    const transcription = await groq.audio.transcriptions.create({
+      file: formData.get('file') as File,
+      model: "whisper-large-v3",
+      language: "en",
+    });
+
+    const text = transcription.text;
+    const jokeCheck = await checkForJoke(text);
+
+    if (jokeCheck.isJoke) {
+      const funniness = await rateFunniness(text);
+      return [{
+        transcription: text,
+        isJoke: true,
+        funniness: funniness
+      }];
+    } else {
+      return [{
+        transcription: text,
+        isJoke: false
+      }];
+    }
+  } catch (error) {
+    console.error('Transcription or analysis error:', error);
+    return [{
+      transcription: '',
+      isJoke: false
+    }];
+  }
+}
+
+
 
 async function transcribeAndAnalyzeChunks(chunks: string[]): Promise<Array<{transcription: string, isJoke: boolean, funniness?: number}>> {
   const results = [];
